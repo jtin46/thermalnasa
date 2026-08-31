@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'screens/gis_monitoring_screen.dart';
+import 'screens/login_screen.dart';
 import 'services/iot_sensor_service.dart';
 
 void main() {
@@ -28,7 +28,7 @@ class ThermalSentinelApp extends StatelessWidget {
         scaffoldBackgroundColor: const Color(0xFF181A20),
         primarySwatch: Colors.deepOrange,
       ),
-      home: const GisMonitoringScreen(),
+      home: const LoginScreen(),
     );
   }
 }

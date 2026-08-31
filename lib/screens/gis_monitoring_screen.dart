@@ -7,6 +7,7 @@ import '../services/iot_sensor_service.dart';
 import '../services/data_ingestion_service.dart';
 import '../services/osm_service.dart';
 import 'alerts_dashboard.dart';
+import 'iot_setup_screen.dart'; // Import the new hardware setup screen
 
 class GisMonitoringScreen extends StatefulWidget {
   const GisMonitoringScreen({super.key});
@@ -70,49 +71,6 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
     }
   }
 
-  void _showAddSensorDialog(BuildContext context) {
-    final deviceIdCtrl = TextEditingController();
-    final facilityCtrl = TextEditingController();
-    final latCtrl = TextEditingController();
-    final lonCtrl = TextEditingController();
-
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF252A34),
-        title: const Text('Register Industrial Sensor', style: TextStyle(color: Colors.white)),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(controller: deviceIdCtrl, style: const TextStyle(color: Colors.white), decoration: const InputDecoration(labelText: 'Device ID (e.g., SENSOR_03)', labelStyle: TextStyle(color: Colors.white54))),
-              TextField(controller: facilityCtrl, style: const TextStyle(color: Colors.white), decoration: const InputDecoration(labelText: 'Facility Name', labelStyle: TextStyle(color: Colors.white54))),
-              TextField(controller: latCtrl, keyboardType: TextInputType.number, style: const TextStyle(color: Colors.white), decoration: const InputDecoration(labelText: 'Latitude', labelStyle: TextStyle(color: Colors.white54))),
-              TextField(controller: lonCtrl, keyboardType: TextInputType.number, style: const TextStyle(color: Colors.white), decoration: const InputDecoration(labelText: 'Longitude', labelStyle: TextStyle(color: Colors.white54))),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          ElevatedButton(
-            onPressed: () {
-              final newSensor = IoTSensorNode(
-                deviceId: deviceIdCtrl.text,
-                facilityName: facilityCtrl.text,
-                coordinates: LatLng(double.parse(latCtrl.text), double.parse(lonCtrl.text)),
-                liveTemperatureCelsius: 25.0,
-                lastUpdated: DateTime.now(),
-              );
-              Provider.of<IoTSensorService>(context, listen: false).registerSensor(newSensor);
-              Navigator.pop(ctx);
-            },
-            child: const Text('Connect'),
-          ),
-        ],
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -134,7 +92,12 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
         ] : [],
       ),
       floatingActionButton: _currentIndex == 0 ? FloatingActionButton.extended(
-        onPressed: () => _showAddSensorDialog(context),
+        onPressed: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (context) => const IotSetupScreen()),
+          );
+        },
         backgroundColor: Colors.blueAccent,
         icon: const Icon(Icons.add_chart, color: Colors.white),
         label: const Text('Connect IoT Sensor', style: TextStyle(color: Colors.white)),
