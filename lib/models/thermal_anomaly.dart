@@ -1,4 +1,6 @@
+import 'dart:math' as math;
 import 'package:latlong2/latlong.dart';
+import '../services/historical_baseline_service.dart';
 
 enum AnomalyType {
   industrialFlare,
@@ -31,7 +33,6 @@ class ThermalAnomaly {
 
   double get temperatureCelsius => brightnessTempKelvin - 273.15;
 
-  // AI/Heuristic Risk Scoring (0-100)
   int get riskScore {
     double score = (confidence * 0.4) + ((frp > 200 ? 200 : frp) * 0.3);
     if (classification == AnomalyType.industrialAccident) score += 30;
@@ -46,33 +47,60 @@ class ThermalAnomaly {
     return 'LOW';
   }
 
-  factory ThermalAnomaly.fromFirmsCsv({
+  factory ThermalAnomaly.classifyEvent({
     required double lat,
     required double lon,
     required double brightness,
     required double frp,
     required double confidence,
-    required List<IndustrialPolygon> facilities,
+    required List<OsmPolygon> contextPolygons,
+    required HistoricalBaselineService baselineService,
   }) {
     final point = LatLng(lat, lon);
 
-    IndustrialPolygon? matched;
-    for (final facility in facilities) {
-      if (facility.contains(point)) {
-        matched = facility;
-        break;
+    OsmPolygon? closestIndustrial;
+    OsmPolygon? matchedLandCover;
+    double closestDistanceKm = double.infinity;
+
+    // Scan all polygons for distance and containment
+    for (final polygon in contextPolygons) {
+      if (polygon.category == 'industrial') {
+        double dist = polygon.distanceTo(point);
+        if (dist < closestDistanceKm) {
+          closestDistanceKm = dist;
+          closestIndustrial = polygon;
+        }
+      } else if (polygon.contains(point)) {
+        matchedLandCover = polygon;
       }
     }
 
     AnomalyType type = AnomalyType.unclassified;
-    if (matched != null) {
-      type = (frp > 150 || brightness > 380)
-          ? AnomalyType.industrialAccident
-          : AnomalyType.industrialFlare;
-    } else {
-      type = (frp > 50 && confidence > 70)
-          ? AnomalyType.wildfire
-          : AnomalyType.agriculturalBurn;
+    String? matchedName;
+
+    // FLOWCHART LEFT BRANCH: Is it near an OSM industrial facility? (Buffer: 1.5 km)
+    if (closestIndustrial != null && closestDistanceKm <= 1.5) {
+      matchedName = closestIndustrial.name;
+
+      // Update historical baseline with this new reading
+      baselineService.recordFrpReading(closestIndustrial.id, frp);
+
+      // FLOWCHART: Compare with historical baseline
+      if (baselineService.isSuddenIncrease(closestIndustrial.id, frp)) {
+        type = AnomalyType.industrialAccident;
+      } else {
+        type = AnomalyType.industrialFlare;
+      }
+    }
+    // FLOWCHART RIGHT BRANCH: Check land cover (Outside industrial buffer)
+    else {
+      if (matchedLandCover?.category == 'agriculture' || (frp <= 50 && confidence <= 70)) {
+        type = AnomalyType.agriculturalBurn;
+      } else if (matchedLandCover?.category == 'forest' || (frp > 50 && confidence > 70)) {
+        type = AnomalyType.wildfire;
+      } else {
+        type = AnomalyType.agriculturalBurn; // Default fallback for open areas
+      }
     }
 
     return ThermalAnomaly(
@@ -82,22 +110,22 @@ class ThermalAnomaly {
       frp: frp,
       acquisitionTime: DateTime.now(),
       confidence: confidence,
-      matchedFacilityName: matched?.name,
+      matchedFacilityName: matchedName,
       classification: type,
     );
   }
 }
 
-class IndustrialPolygon {
+class OsmPolygon {
   final String id;
   final String name;
-  final String type;
+  final String category; // 'industrial', 'agriculture', or 'forest'
   final List<LatLng> boundary;
 
-  IndustrialPolygon({
+  OsmPolygon({
     required this.id,
     required this.name,
-    required this.type,
+    required this.category,
     required this.boundary,
   });
 
@@ -128,5 +156,30 @@ class IndustrialPolygon {
     double edgeSlope = (by - ay) / (bx - ax);
     double pointSlope = (py - ay) / (px - ax);
     return pointSlope >= edgeSlope;
+  }
+
+  // Haversine formula to calculate proximity to the polygon's closest boundary vertex
+  double distanceTo(LatLng point) {
+    const double earthRadiusKm = 6371.0;
+    double minDistance = double.infinity;
+
+    for (var vertex in boundary) {
+      double dLat = _degreesToRadians(vertex.latitude - point.latitude);
+      double dLon = _degreesToRadians(vertex.longitude - point.longitude);
+
+      double a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+          math.cos(_degreesToRadians(point.latitude)) * math.cos(_degreesToRadians(vertex.latitude)) *
+              math.sin(dLon / 2) * math.sin(dLon / 2);
+
+      double c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+      double distance = earthRadiusKm * c;
+
+      if (distance < minDistance) minDistance = distance;
+    }
+    return minDistance;
+  }
+
+  double _degreesToRadians(double degrees) {
+    return degrees * math.pi / 180;
   }
 }

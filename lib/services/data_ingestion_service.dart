@@ -1,28 +1,48 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:http/http.dart' as http;
 import 'package:csv/csv.dart';
-import 'package:latlong2/latlong.dart';
-import '../models/thermal_anomaly.dart'; // From previous architecture
+import '../models/thermal_anomaly.dart';
+import 'historical_baseline_service.dart';
 
 class DataIngestionService {
-  Future<List<ThermalAnomaly>> loadNasaFirmsData(String assetPath, List<IndustrialPolygon> facilities) async {
-    final rawData = await rootBundle.loadString(assetPath);
-    List<List<dynamic>> rowsAsListOfValues = const CsvToListConverter(eol: '\n').convert(rawData);
+  static const String _nasaApiKey = '77bc6f7a09acc13c9577c1cf4224d6d8';
 
+  Future<List<ThermalAnomaly>> loadNasaFirmsData(
+      String localAssetPath,
+      List<OsmPolygon> contextPolygons,
+      HistoricalBaselineService baselineService
+      ) async {
+    final liveApiUrl = Uri.parse(
+        'https://firms.modaps.eosdis.nasa.gov/api/country/csv/$_nasaApiKey/VIIRS_NOAA20_NRT/IND/1'
+    );
+
+    try {
+      final response = await http.get(liveApiUrl).timeout(const Duration(seconds: 10));
+      if (response.statusCode == 200 && !response.body.contains('Invalid Map Key')) {
+        return _parseFirmsCsv(response.body, contextPolygons, baselineService);
+      }
+    } catch (e) {
+      debugPrint('NASA API failed, using local asset fallback.');
+    }
+
+    final rawData = await rootBundle.loadString(localAssetPath);
+    return _parseFirmsCsv(rawData, contextPolygons, baselineService);
+  }
+
+  List<ThermalAnomaly> _parseFirmsCsv(String rawCsv, List<OsmPolygon> contextPolygons, HistoricalBaselineService baselineService) {
+    List<List<dynamic>> rows = const CsvToListConverter(eol: '\n').convert(rawCsv);
     List<ThermalAnomaly> anomalies = [];
 
-    // Skip header row (index 0)
-    for (int i = 1; i < rowsAsListOfValues.length; i++) {
-      final row = rowsAsListOfValues[i];
-      if (row.length < 13) continue; // Ensure row has all FIRMS columns
+    for (int i = 1; i < rows.length; i++) {
+      final row = rows[i];
+      if (row.length < 13) continue;
 
-      // Columns based on uploaded fire_nrt_J2V-C2_793578.csv:
-      // latitude[0], longitude[1], brightness[2], scan[3], track[4], acq_date[5], acq_time[6], satellite[7], instrument[8], confidence[9], version[10], bright_t31[11], frp[12], daynight[13]
       final lat = double.parse(row[0].toString());
       final lon = double.parse(row[1].toString());
       final bright = double.parse(row[2].toString());
 
-      // Some confidence values are missing or character-based ('N', 'H') depending on the satellite (VIIRS vs MODIS).
-      final confString = row[9].toString();
+      final confString = row[9].toString().toLowerCase();
       double conf = 50.0;
       if (confString == 'l' || confString == 'low') conf = 30.0;
       if (confString == 'n' || confString == 'nominal') conf = 70.0;
@@ -31,16 +51,16 @@ class DataIngestionService {
 
       final frpVal = double.tryParse(row[12].toString()) ?? 0.0;
 
-      anomalies.add(ThermalAnomaly.fromFirmsCsv(
+      anomalies.add(ThermalAnomaly.classifyEvent(
           lat: lat,
           lon: lon,
           brightness: bright,
           frp: frpVal,
           confidence: conf,
-          facilities: facilities
+          contextPolygons: contextPolygons,
+          baselineService: baselineService
       ));
     }
-
     return anomalies;
   }
 }

@@ -4,16 +4,17 @@ import 'package:latlong2/latlong.dart';
 import '../models/thermal_anomaly.dart';
 
 class OsmService {
-  // We query a bounding box around the densest thermal anomalies in your dataset
-  Future<List<IndustrialPolygon>> fetchIndustrialZones() async {
+  Future<List<OsmPolygon>> fetchGeospatialContext() async {
     const String overpassUrl = 'https://overpass-api.de/api/interpreter';
 
-    // OSM Query: Find industrial landuse and power plants within a specific bounding box
+    // Expanded query covering Industry, Farmland, and Forests
     const String query = '''
-      [out:json];
+      [out:json][timeout:25];
       (
         way["landuse"="industrial"](20.0, 84.0, 25.0, 89.0);
         way["power"="plant"](20.0, 84.0, 25.0, 89.0);
+        way["landuse"="farmland"](20.0, 84.0, 25.0, 89.0);
+        way["natural"="wood"](20.0, 84.0, 25.0, 89.0);
       );
       out geom;
     ''';
@@ -22,7 +23,7 @@ class OsmService {
       final response = await http.post(Uri.parse(overpassUrl), body: query);
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
-        List<IndustrialPolygon> facilities = [];
+        List<OsmPolygon> polygons = [];
 
         for (var element in data['elements']) {
           if (element['type'] == 'way' && element['geometry'] != null) {
@@ -30,18 +31,26 @@ class OsmService {
             for (var geo in element['geometry']) {
               boundary.add(LatLng(geo['lat'], geo['lon']));
             }
-            facilities.add(IndustrialPolygon(
+
+            String category = 'agriculture';
+            if (element['tags']?['landuse'] == 'industrial' || element['tags']?.containsKey('power') == true) {
+              category = 'industrial';
+            } else if (element['tags']?['natural'] == 'wood') {
+              category = 'forest';
+            }
+
+            polygons.add(OsmPolygon(
               id: element['id'].toString(),
-              name: element['tags']?['name'] ?? 'Unknown Industrial Facility',
-              type: element['tags']?['power'] ?? element['tags']?['landuse'] ?? 'Industrial',
+              name: element['tags']?['name'] ?? 'Unknown $category Area',
+              category: category,
               boundary: boundary,
             ));
           }
         }
-        return facilities;
+        return polygons;
       }
     } catch (e) {
-      // In a production app, handle network errors here
+      // Handle network errors silently
     }
     return [];
   }

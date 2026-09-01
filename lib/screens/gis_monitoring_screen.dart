@@ -6,8 +6,9 @@ import '../models/thermal_anomaly.dart';
 import '../services/iot_sensor_service.dart';
 import '../services/data_ingestion_service.dart';
 import '../services/osm_service.dart';
+import '../services/historical_baseline_service.dart';
 import 'alerts_dashboard.dart';
-import 'iot_setup_screen.dart'; // Import the new hardware setup screen
+import 'iot_setup_screen.dart';
 
 class GisMonitoringScreen extends StatefulWidget {
   const GisMonitoringScreen({super.key});
@@ -28,31 +29,56 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
   @override
   void initState() {
     super.initState();
-    _loadDataset();
+    _loadDatasetOptimized();
   }
 
-  Future<void> _loadDataset() async {
+  Future<void> _loadDatasetOptimized() async {
     final ingestionService = DataIngestionService();
     final osmService = OsmService();
+    final baselineService = HistoricalBaselineService();
+    await baselineService.init();
 
     try {
-      final facilities = await osmService.fetchIndustrialZones();
-      final anomalies = await ingestionService.loadNasaFirmsData(
-          'assets/fire_nrt_J2V-C2_793578.csv',
-          facilities
+      // Fast load with empty context polygons
+      final initialAnomalies = await ingestionService.loadNasaFirmsData(
+        'assets/fire_nrt_J2V-C2_793578.csv',
+        [],
+        baselineService,
       );
 
       if (mounted) {
         setState(() {
-          _firmsAnomalies = anomalies;
+          _firmsAnomalies = initialAnomalies;
           _isLoading = false;
         });
       }
+
+      // Background load of geospatial context polygons
+      final contextPolygons = await osmService.fetchGeospatialContext().timeout(
+        const Duration(seconds: 15),
+        onTimeout: () => [],
+      );
+
+      // Re-classify anomalies with geospatial and baseline context
+      if (contextPolygons.isNotEmpty && mounted) {
+        final updatedAnomalies = await ingestionService.loadNasaFirmsData(
+          'assets/fire_nrt_J2V-C2_793578.csv',
+          contextPolygons,
+          baselineService,
+        );
+        setState(() {
+          _firmsAnomalies = updatedAnomalies;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Land Cover & Industrial Buffer Analytics Synced!'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
     } catch (e) {
       debugPrint("Data Load Error: $e");
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -65,7 +91,7 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
       case AnomalyType.wildfire:
         return Colors.deepOrange;
       case AnomalyType.agriculturalBurn:
-        return Colors.amber;
+        return Colors.green;
       case AnomalyType.unclassified:
         return Colors.grey;
     }
@@ -92,12 +118,10 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
         ] : [],
       ),
       floatingActionButton: _currentIndex == 0 ? FloatingActionButton.extended(
-        onPressed: () {
-          Navigator.push(
-            context,
-            MaterialPageRoute(builder: (context) => const IotSetupScreen()),
-          );
-        },
+        onPressed: () => Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => const IotSetupScreen()),
+        ),
         backgroundColor: Colors.blueAccent,
         icon: const Icon(Icons.add_chart, color: Colors.white),
         label: const Text('Connect IoT Sensor', style: TextStyle(color: Colors.white)),
@@ -127,9 +151,17 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
 
   Widget _buildMapView(BuildContext context) {
     final iotService = Provider.of<IoTSensorService>(context);
-    final displayedAnomalies = _showIndustrialOnly
-        ? _firmsAnomalies.where((a) => a.classification == AnomalyType.industrialFlare || a.classification == AnomalyType.industrialAccident).toList()
-        : _firmsAnomalies;
+
+    List<ThermalAnomaly> markersToDisplay = _showIndustrialOnly
+        ? _firmsAnomalies.where((a) =>
+    a.classification == AnomalyType.industrialFlare ||
+        a.classification == AnomalyType.industrialAccident).toList()
+        : List.from(_firmsAnomalies);
+
+    if (markersToDisplay.length > 400) {
+      markersToDisplay.sort((a, b) => b.riskScore.compareTo(a.riskScore));
+      markersToDisplay = markersToDisplay.take(400).toList();
+    }
 
     return Stack(
       children: [
@@ -138,6 +170,9 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
           options: const MapOptions(
             initialCenter: LatLng(22.38, 87.28),
             initialZoom: 6.0,
+            interactionOptions: InteractionOptions(
+              flags: InteractiveFlag.all & ~InteractiveFlag.rotate,
+            ),
           ),
           children: [
             TileLayer(
@@ -145,18 +180,18 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
               userAgentPackageName: 'com.example.thermal_sentinel',
             ),
             MarkerLayer(
-              markers: displayedAnomalies.map((anomaly) {
+              markers: markersToDisplay.map((anomaly) {
                 return Marker(
                   point: anomaly.location,
-                  width: 12,
-                  height: 12,
+                  width: 14,
+                  height: 14,
                   child: GestureDetector(
                     onTap: () => _showAnomalyDetails(context, anomaly),
-                    child: Container(
+                    child: DecoratedBox(
                       decoration: BoxDecoration(
-                        color: _getMarkerColor(anomaly.classification).withValues(alpha: 0.85),
+                        color: _getMarkerColor(anomaly.classification).withValues(alpha: 0.9),
                         shape: BoxShape.circle,
-                        border: Border.all(color: Colors.white, width: 1),
+                        border: Border.all(color: Colors.black54, width: 1.5),
                       ),
                     ),
                   ),
@@ -204,12 +239,15 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('Classification Overlay', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            const Text(
+              'Classification Overlay',
+              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 6),
             _legendItem(Colors.orangeAccent, 'Industrial Flare/Process'),
             _legendItem(Colors.redAccent, 'Industrial Thermal Anomaly'),
             _legendItem(Colors.deepOrange, 'Wildfire / Forest Fire'),
-            _legendItem(Colors.amber, 'Agricultural Burn'),
+            _legendItem(Colors.green, 'Agricultural Burn'),
             _legendItem(Colors.blueAccent, 'IoT Ground Sensor'),
           ],
         ),
@@ -223,7 +261,11 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Container(width: 12, height: 12, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+          Container(
+            width: 12,
+            height: 12,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          ),
           const SizedBox(width: 8),
           Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12)),
         ],
@@ -235,31 +277,60 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF252A34),
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
       builder: (ctx) => Padding(
         padding: const EdgeInsets.all(20.0),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Detection ID: ${anomaly.id}', style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(
+              'Detection ID: ${anomaly.id}',
+              style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 10),
             Row(
               children: [
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  decoration: BoxDecoration(color: Colors.red, borderRadius: BorderRadius.circular(4)),
-                  child: Text('Risk: ${anomaly.riskScore}/100', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  decoration: BoxDecoration(
+                    color: Colors.red,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    'Risk: ${anomaly.riskScore}/100',
+                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                  ),
                 ),
                 const SizedBox(width: 8),
-                Text('Classification: ${anomaly.classification.name}', style: TextStyle(color: _getMarkerColor(anomaly.classification), fontWeight: FontWeight.w600)),
+                Text(
+                  'Classification: ${anomaly.classification.name}',
+                  style: TextStyle(
+                    color: _getMarkerColor(anomaly.classification),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 10),
-            Text('Satellite Temp: ${anomaly.temperatureCelsius.toStringAsFixed(1)} °C (${anomaly.brightnessTempKelvin} K)', style: const TextStyle(color: Colors.white70)),
-            Text('Fire Radiative Power (FRP): ${anomaly.frp} MW', style: const TextStyle(color: Colors.white70)),
-            Text('Facility Matched: ${anomaly.matchedFacilityName ?? "None (Open Area)"}', style: const TextStyle(color: Colors.white70)),
-            Text('Confidence Score: ${anomaly.confidence}%', style: const TextStyle(color: Colors.white70)),
+            Text(
+              'Satellite Temp: ${anomaly.temperatureCelsius.toStringAsFixed(1)} °C (${anomaly.brightnessTempKelvin} K)',
+              style: const TextStyle(color: Colors.white70),
+            ),
+            Text(
+              'Fire Radiative Power (FRP): ${anomaly.frp} MW',
+              style: const TextStyle(color: Colors.white70),
+            ),
+            Text(
+              'Facility Matched: ${anomaly.matchedFacilityName ?? "None (Open Area)"}',
+              style: const TextStyle(color: Colors.white70),
+            ),
+            Text(
+              'Confidence Score: ${anomaly.confidence}%',
+              style: const TextStyle(color: Colors.white70),
+            ),
           ],
         ),
       ),
@@ -270,18 +341,36 @@ class _GisMonitoringScreenState extends State<GisMonitoringScreen> {
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF252A34),
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
       builder: (ctx) => Padding(
         padding: const EdgeInsets.all(20.0),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Sensor: ${sensor.deviceId}', style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(
+              'Sensor: ${sensor.deviceId}',
+              style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 6),
-            Text('Facility: ${sensor.facilityName}', style: const TextStyle(color: Colors.blueAccent, fontWeight: FontWeight.w600)),
-            Text('Live Ground Temperature: ${sensor.liveTemperatureCelsius} °C', style: TextStyle(color: sensor.alertActive ? Colors.redAccent : Colors.greenAccent, fontSize: 16, fontWeight: FontWeight.bold)),
-            Text('Last Heartbeat: ${sensor.lastUpdated.toLocal()}', style: const TextStyle(color: Colors.white54)),
+            Text(
+              'Facility: ${sensor.facilityName}',
+              style: const TextStyle(color: Colors.blueAccent, fontWeight: FontWeight.w600),
+            ),
+            Text(
+              'Live Ground Temperature: ${sensor.liveTemperatureCelsius} °C',
+              style: TextStyle(
+                color: sensor.alertActive ? Colors.redAccent : Colors.greenAccent,
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            Text(
+              'Last Heartbeat: ${sensor.lastUpdated.toLocal()}',
+              style: const TextStyle(color: Colors.white54),
+            ),
           ],
         ),
       ),
